@@ -1,186 +1,162 @@
 /**
- * agentx-browser Worker — ONE stable URL in front of rotating GitHub runners.
+ * AgentX cloud browser PoC — Cloudflare Worker + Durable Object relay.
  *
- * Setup (Cloudflare dashboard, no CLI needed):
- *   1. Workers & Pages -> Create Worker -> paste this file -> Deploy.
- *   2. Settings -> Variables -> Add secret variables:
- *        RELAY_SECRET  (runner registration secret, e.g. openssl rand -hex 32)
- *        CLIENT_TOKEN  (the token your app/tests must present)
- *   3. Settings -> Bindings -> Add binding -> KV namespace:
- *        create namespace "BROWSER_BACKEND", variable name BACKEND.
+ * Architecture (no third-party tunnel service):
  *
- * API:
- *   POST /register   (runner only, Authorization: Bearer <RELAY_SECRET>)
- *                    body: {"url":"https://xxx.trycloudflare.com"}
- *   GET  /health     public, returns backend age only (never the URL)
- *   ALL  /*          requires ?token=<CLIENT_TOKEN> or
- *                    Authorization: Bearer <CLIENT_TOKEN>; proxies HTTP and
- *                    WebSocket (CDP) to the current backend, rewriting
- *                    debugger URLs to point back at this Worker.
+ *   Client --HTTPS/WSS + CLIENT_TOKEN--> Worker --(DO binding)--> BrowserRelay DO
+ *                                                              (singleton, named "browser-main")
+ *   GitHub runner: Chromium --CDP--> relay.py --WSS + RELAY_SECRET--> same DO
+ *
+ * The Durable Object is a singleton, so the runner's uplink WebSocket and all
+ * client requests meet in one place — no isolate problem, no tunnel provider,
+ * no extra signup. The runner just opens an outbound WSS to /relay; the DO
+ * swaps in a successor runner with zero client-visible downtime.
+ *
+ * No KV is used at all: the DO itself tracks whether a runner is connected.
  */
 
-const BACKEND_KEY = "current";
-// Tunnel providers: the runner currently uses tunnelmole — no signup, no
-// account, prints its public https:// URL reliably to stdout.
-// Dropped: cloudflared quick tunnels (their edge 403-blocks datacenter IPs,
-// including Cloudflare Workers themselves); localhost.run (never prints the
-// assigned tunnel URL without an interactive terminal); pinggy (free tier now
-// needs a token / has a 60-min cap); ngrok (signup now demands a payment
-// method); bore (bore.pub printed a URL but never forwarded any data).
-const TUNNEL_RE = /^https:\/\/[a-z0-9.-]+\.(trycloudflare\.com|localhost\.run|ngrok-free\.app|ngrok\.io|tunnelmole\.net)\/?$/;
+const DO_NAME = "browser-main";
+const HTTP_TIMEOUT_MS = 15000;
 
-// Free-tier KV guard: the tunnel URL is cached in the Worker's memory and
-// KV is read at most ONCE PER 60 SECONDS per Worker isolate, instead of on
-// every proxied request. Writes happen ~5x/day (once per runner restart).
-// Free KV limits: 100k reads/day, 1k writes/day, 1GB — we stay far below.
-let cachedBackend = null; // {url, updated_at, fetched_at}
-const BACKEND_CACHE_TTL_MS = 60_000;
-
-async function getBackend(env) {
-  const now = Date.now();
-  if (cachedBackend && now - cachedBackend.fetched_at < BACKEND_CACHE_TTL_MS) {
-    return cachedBackend;
-  }
-  let raw = await env.BACKEND.get(BACKEND_KEY);
-  if (!raw) {
-    // KV is eventually consistent across PoPs; one quick retry so a fresh
-    // registration is not reported missing to the next request.
-    await new Promise(r => setTimeout(r, 2000));
-    raw = await env.BACKEND.get(BACKEND_KEY);
-  }
-  if (!raw) { cachedBackend = null; return null; }
-  const b = JSON.parse(raw);
-  cachedBackend = { url: b.url, updated_at: b.updated_at, fetched_at: now };
-  return cachedBackend;
-}
-
-function clientToken(request) {
-  const url = new URL(request.url);
-  const q = url.searchParams.get("token");
-  if (q) return q;
-  const h = request.headers.get("Authorization") || "";
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : "";
-}
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-function rewriteDebuggerUrls(text, publicOrigin, backendUrl) {
-  const wssOrigin = publicOrigin.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
-  return text
-    .split(backendUrl).join(publicOrigin)
-    .split(backendUrl.replace(/^https:\/\//, "wss://")).join(wssOrigin)
-    .replace(/ws:\/\/127\.0\.0\.1:9222/g, wssOrigin)
-    .replace(/ws:\/\/localhost:9222/g, wssOrigin);
-}
-
-async function proxyWebSocket(clientRequest, backendUrl) {
-  const upstreamUrl = backendUrl.toString()
-    .replace(/^https:\/\//, "wss://")
-    .replace(/^http:\/\//, "ws://");
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
-  server.accept();
-
-  let upstream;
-  try {
-    upstream = new WebSocket(upstreamUrl);
-    await new Promise((resolve, reject) => {
-      upstream.addEventListener("open", resolve, { once: true });
-      upstream.addEventListener("error", reject, { once: true });
-    });
-  } catch (e) {
-    try { server.close(1011, "backend unreachable"); } catch {}
-    return new Response("backend unreachable", { status: 502 });
+export class BrowserRelay {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.runner = null;          // WebSocket to the current runner uplink
+    this.clients = new Map();    // connId -> client WebSocket (CDP sessions)
+    this.pending = new Map();    // httpReqId -> {resolve, timer}
+    this.seq = 0;
   }
 
-  const closeBoth = () => {
-    try { upstream.close(); } catch {}
-    try { server.close(); } catch {}
-  };
-  server.addEventListener("message", (e) => { try { upstream.send(e.data); } catch {} });
-  upstream.addEventListener("message", (e) => { try { server.send(e.data); } catch {} });
-  server.addEventListener("close", closeBoth);
-  server.addEventListener("error", closeBoth);
-  upstream.addEventListener("close", closeBoth);
-  upstream.addEventListener("error", closeBoth);
+  async fetch(req) {
+    const url = new URL(req.url);
+    const path = url.pathname;
 
-  return new Response(null, { status: 101, webSocket: client });
+    // ---- Runner uplink: persistent WebSocket, authenticated by RELAY_SECRET ----
+    if (path === "/relay") {
+      if (req.headers.get("upgrade") !== "websocket") {
+        return new Response("websocket required", { status: 400 });
+      }
+      if (url.searchParams.get("secret") !== this.env.RELAY_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      // A successor runner replaces the old uplink seamlessly.
+      if (this.runner) { try { this.runner.close(1000, "replaced"); } catch (e) {} }
+      // Drop any client sessions tied to the old runner; clients reconnect.
+      for (const [, ws] of this.clients) { try { ws.close(1001, "runner replaced"); } catch (e) {} }
+      this.clients.clear();
+      this.runner = server;
+      server.addEventListener("message", (ev) => this.onRunnerMessage(ev.data));
+      const drop = () => { if (this.runner === server) this.runner = null; };
+      server.addEventListener("close", drop);
+      server.addEventListener("error", drop);
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // ---- Public health: reveals only whether a runner is connected ----
+    if (path === "/health") {
+      return Response.json({ ok: this.runner !== null, ts: Date.now() });
+    }
+
+    // ---- Client auth gate ----
+    if (url.searchParams.get("token") !== this.env.CLIENT_TOKEN) {
+      return new Response("unauthorized", { status: 401 });
+    }
+    if (!this.runner) {
+      return Response.json({ error: "browser offline" }, { status: 503 });
+    }
+
+    // ---- Client CDP WebSocket: pipe through the runner ----
+    if (req.headers.get("upgrade") === "websocket" && path.startsWith("/devtools/")) {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      server.accept();
+      const connId = "c" + (++this.seq) + "_" + Date.now().toString(36);
+      this.clients.set(connId, server);
+      try {
+        this.runner.send(JSON.stringify({ type: "ws_open", id: connId, path: path }));
+      } catch (e) {
+        this.clients.delete(connId);
+        return new Response("runner unavailable", { status: 502 });
+      }
+      server.addEventListener("message", (ev) => {
+        if (this.runner) {
+          try { this.runner.send(JSON.stringify({ type: "ws_msg", id: connId, data: ev.data })); } catch (e) {}
+        }
+      });
+      const cleanup = () => {
+        this.clients.delete(connId);
+        if (this.runner) {
+          try { this.runner.send(JSON.stringify({ type: "ws_close", id: connId })); } catch (e) {}
+        }
+      };
+      server.addEventListener("close", cleanup);
+      server.addEventListener("error", cleanup);
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // ---- Client CDP HTTP (e.g. /json/version, /json/list, PUT /json/new) ----
+    if (path.startsWith("/json/")) {
+      const reqId = "h" + (++this.seq);
+      const body = (req.method === "GET" || req.method === "HEAD") ? null : await req.text();
+      let result = null;
+      try {
+        result = await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            this.pending.delete(reqId);
+            reject(new Error("timeout"));
+          }, HTTP_TIMEOUT_MS);
+          this.pending.set(reqId, { resolve, timer });
+          try {
+            this.runner.send(JSON.stringify({
+              type: "http", id: reqId, method: req.method,
+              path: path + url.search, body: body,
+            }));
+          } catch (e) {
+            clearTimeout(timer);
+            this.pending.delete(reqId);
+            reject(e);
+          }
+        });
+      } catch (e) { /* result stays null -> 504 */ }
+      if (!result) return Response.json({ error: "browser timeout" }, { status: 504 });
+      // Rewrite Chromium's ws://127.0.0.1:9222 URLs to our authenticated WSS endpoint.
+      const text = (result.body || "").replaceAll("ws://127.0.0.1:9222", `wss://${url.host}`);
+      return new Response(text, {
+        status: result.status || 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    return new Response("not found", { status: 404 });
+  }
+
+  onRunnerMessage(data) {
+    let msg;
+    try { msg = JSON.parse(data); } catch (e) { return; }
+    if (msg.type === "http_res") {
+      const p = this.pending.get(msg.id);
+      if (p) { clearTimeout(p.timer); this.pending.delete(msg.id); p.resolve(msg); }
+    } else if (msg.type === "ws_msg") {
+      const client = this.clients.get(msg.id);
+      if (client) { try { client.send(msg.data); } catch (e) {} }
+    } else if (msg.type === "ws_closed") {
+      const client = this.clients.get(msg.id);
+      if (client) {
+        try { client.close(1000, "target closed"); } catch (e) {}
+        this.clients.delete(msg.id);
+      }
+    }
+  }
 }
 
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // ---- runner registration ----
-    if (request.method === "POST" && path === "/register") {
-      const auth = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
-      if (!env.RELAY_SECRET || auth !== env.RELAY_SECRET) {
-        return new Response("forbidden", { status: 403 });
-      }
-      let body;
-      try { body = await request.json(); }
-      catch { return new Response("bad json", { status: 400 }); }
-      const backend = String(body.url || "").replace(/\/$/, "");
-      if (!TUNNEL_RE.test(backend)) return new Response("bad url", { status: 400 });
-      const record = { url: backend, updated_at: Date.now() };
-      await env.BACKEND.put(BACKEND_KEY, JSON.stringify(record));
-      cachedBackend = { ...record, fetched_at: Date.now() }; // serve fresh immediately
-      return json({ ok: true });
-    }
-
-    // ---- public health (no URL leak) ----
-    if (path === "/health") {
-      const b = await getBackend(env);
-      if (!b) return json({ ok: false, reason: "no backend registered" }, 503);
-      return json({ ok: true, backend_age_s: Math.floor((Date.now() - b.updated_at) / 1000) });
-    }
-
-    // ---- everything else needs the client token ----
-    const token = clientToken(request);
-    if (!env.CLIENT_TOKEN || token !== env.CLIENT_TOKEN) {
-      return new Response("unauthorized", { status: 401 });
-    }
-
-    const b = await getBackend(env);
-    if (!b) return new Response("no backend registered", { status: 502 });
-    const backend = b.url;
-
-    const fwd = new URL(backend + path);
-    // forward query string minus our token param
-    url.searchParams.forEach((v, k) => { if (k !== "token") fwd.searchParams.append(k, v); });
-
-    if (request.headers.get("Upgrade") === "websocket") {
-      return proxyWebSocket(request, fwd);
-    }
-
-    const headers = new Headers();
-    const ct = request.headers.get("content-type");
-    if (ct) headers.set("content-type", ct);
-    const accept = request.headers.get("accept");
-    if (accept) headers.set("accept", accept);
-
-    let resp;
-    try {
-      resp = await fetch(fwd.toString(), {
-        method: request.method,
-        headers,
-        body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-      });
-    } catch {
-      return new Response("backend unreachable", { status: 502 });
-    }
-
-    const text = rewriteDebuggerUrls(await resp.text(), url.origin, backend);
-    return new Response(text, {
-      status: resp.status,
-      headers: { "content-type": resp.headers.get("content-type") || "application/json" },
-    });
+  async fetch(req, env) {
+    const id = env.RELAY.idFromName(DO_NAME);
+    const stub = env.RELAY.get(id);
+    return stub.fetch(req);
   },
 };

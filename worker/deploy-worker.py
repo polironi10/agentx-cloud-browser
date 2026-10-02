@@ -50,13 +50,24 @@ def api(method, path, data=None, ctype="application/json"):
     return out["result"]
 
 
-def multipart_upload(account_id, script_bytes, kv_namespace_id):
+def multipart_upload(account_id, script_bytes):
+    """Upload the Worker as an ES module with a Durable Object binding.
+
+    No KV is used anymore: the BrowserRelay DO (singleton "browser-main")
+    tracks the runner uplink itself. The migration declares the new DO class.
+    """
     boundary = "----MuseForm" + uuid.uuid4().hex
     metadata = {
         "main_module": "worker.js",
         "bindings": [
-            {"type": "kv_namespace", "name": "BACKEND", "namespace_id": kv_namespace_id}
+            {"type": "durable_object_namespace", "name": "RELAY",
+             "class_name": "BrowserRelay"},
         ],
+        "migrations": {
+            # Free plan: Durable Objects require the SQLite backend, declared
+            # via new_sqlite_classes (not new_classes).
+            "new_sqlite_classes": ["BrowserRelay"],
+        },
         "compatibility_date": "2024-11-01",
     }
     buf = io.BytesIO()
@@ -89,14 +100,8 @@ def main():
     account_id = accounts[0]["id"]
     print("account:", accounts[0].get("name"), account_id, file=sys.stderr)
 
-    namespaces = api("GET", f"/accounts/{account_id}/storage/kv/namespaces")
-    ns = next((n for n in namespaces if n["title"] == KV_TITLE), None)
-    if ns is None:
-        ns = api("POST", f"/accounts/{account_id}/storage/kv/namespaces", {"title": KV_TITLE})
-    print("kv namespace:", ns["id"], file=sys.stderr)
-
-    multipart_upload(account_id, worker_js, ns["id"])
-    print("script uploaded (es module + kv binding)", file=sys.stderr)
+    multipart_upload(account_id, worker_js)
+    print("script uploaded (es module + durable object binding)", file=sys.stderr)
 
     for name, text in (("RELAY_SECRET", relay_secret), ("CLIENT_TOKEN", client_token)):
         api("PUT", f"/accounts/{account_id}/workers/scripts/{SCRIPT_NAME}/secrets",
@@ -107,8 +112,7 @@ def main():
     worker_url = None
     if isinstance(sub, dict) and sub.get("subdomain"):
         worker_url = f"https://{SCRIPT_NAME}.{sub['subdomain']}.workers.dev"
-    print(json.dumps({"worker_url": worker_url, "kv_namespace_id": ns["id"],
-                      "account_id": account_id}))
+    print(json.dumps({"worker_url": worker_url, "account_id": account_id}))
 
 
 if __name__ == "__main__":
