@@ -15,10 +15,13 @@ name: cloud-browser
 # tunnel returned empty HTTP 500s for tunneled traffic).
 #
 # Restarts are SELF-CHAINED: each run dispatches its own successor via the
-# GitHub API at ~4h50m, well before the 6h job kill. The successor simply
-# opens a new uplink WebSocket; the DO swaps it in with zero client-visible
-# downtime. No reliance on GitHub's scheduled cron. A separate watchdog
-# re-dispatches if the chain ever breaks.
+# GitHub API at ~5h50m, just before the 6h job kill. The successor simply
+# opens a new uplink WebSocket and the DO swaps it in. NOTE: the swap closes
+# active client CDP sockets (1001) — clients must reconnect and will land on
+# the new Chromium instance, so keep the overlap SHORT to limit flapping.
+# dispatch_next() also dedupes: it never dispatches while a NEWER run is
+# already in progress, so one accidental double-dispatch cannot grow back
+# into a multi-runner swarm. No reliance on GitHub's scheduled cron.
 
 on:
   workflow_dispatch:
@@ -93,6 +96,20 @@ jobs:
       - name: Chain successor run and hold until timeout
         run: |
           dispatch_next() {
+            # DEDUPE: if a NEWER cloud-browser run is already in progress, the
+            # fleet already has a successor — dispatching again multiplies
+            # lineages (each run chains its own, swarm regrows).
+            local newer
+            newer=$(curl -sf \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=20" | \
+              jq -r --argjson me "$GITHUB_RUN_ID" \
+                '[.workflow_runs[] | select(.name == "cloud-browser" and .id > $me)] | length')
+            if [ "${newer:-0}" -gt 0 ]; then
+              echo "newer cloud-browser run already in progress; skipping dispatch (dedupe)"
+              return 0
+            fi
             if curl -sf -X POST \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -103,12 +120,13 @@ jobs:
               echo "successor dispatch FAILED"
             fi
           }
-          # Dispatch the next run at ~4h50m so it is serving before this
-          # job is killed at ~5h55m (~1h overlap, zero downtime — the DO
-          # swaps the uplink, clients see nothing).
+          # Dispatch the next run at ~5h50m, just before this job is killed at
+          # ~5h55m. Overlap is ~5 min instead of ~65 min: every minute of
+          # overlap is a window where the DO keeps swapping the uplink and
+          # client CDP sockets get 1001-closed. (Was 4h50m / 17400s.)
           # NOTE: dispatches always run the workflow file as it exists on the
           # branch AT DISPATCH TIME, so successors self-heal to the newest code.
-          ( sleep 17400; dispatch_next ) &
+          ( sleep 21000; dispatch_next ) &
           for i in $(seq 1 70); do
             sleep 300
             # If the relay died AND Chromium is gone, the chain is broken:
